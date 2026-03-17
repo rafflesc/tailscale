@@ -7570,3 +7570,68 @@ func TestRouteAllDisabled(t *testing.T) {
 		})
 	}
 }
+
+func TestCheckSNATPrefs(t *testing.T) {
+	tests := []struct {
+		name    string
+		prefs   ipn.Prefs
+		wantErr bool
+	}{
+		{
+			name: "no-snat-without-exit-node",
+			prefs: ipn.Prefs{
+				NoSNAT: true,
+				AdvertiseRoutes: []netip.Prefix{
+					netip.MustParsePrefix("10.0.0.0/24"),
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "snat-enabled-with-exit-node",
+			prefs: ipn.Prefs{
+				NoSNAT: false,
+				AdvertiseRoutes: []netip.Prefix{
+					netip.MustParsePrefix("10.0.0.0/24"),
+					netip.MustParsePrefix("0.0.0.0/0"),
+					netip.MustParsePrefix("::/0"),
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "no-snat-with-exit-node",
+			prefs: ipn.Prefs{
+				NoSNAT: true,
+				AdvertiseRoutes: []netip.Prefix{
+					netip.MustParsePrefix("10.0.0.0/24"),
+					netip.MustParsePrefix("0.0.0.0/0"),
+					netip.MustParsePrefix("::/0"),
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "no-snat-exit-node-only",
+			prefs: ipn.Prefs{
+				NoSNAT: true,
+				AdvertiseRoutes: []netip.Prefix{
+					netip.MustParsePrefix("0.0.0.0/0"),
+					netip.MustParsePrefix("::/0"),
+				},
+			},
+			wantErr: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			lb := newTestLocalBackend(t)
+			lb.mu.Lock()
+			err := lb.checkSNATPrefsLocked(&tt.prefs)
+			lb.mu.Unlock()
+			if (err != nil) != tt.wantErr {
+				t.Errorf("checkSNATPrefsLocked() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}

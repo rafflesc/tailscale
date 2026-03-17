@@ -4154,7 +4154,17 @@ func (b *LocalBackend) checkPrefsLocked(p *ipn.Prefs) error {
 	if err := b.checkAutoUpdatePrefsLocked(p); err != nil {
 		errs = append(errs, err)
 	}
+	if err := b.checkSNATPrefsLocked(p); err != nil {
+		errs = append(errs, err)
+	}
 	return errors.Join(errs...)
+}
+
+func (b *LocalBackend) checkSNATPrefsLocked(p *ipn.Prefs) error {
+	if p.NoSNAT && p.AdvertisesExitNode() {
+		return errors.New("--snat-subnet-routes=false cannot be used when advertising an exit node")
+	}
+	return nil
 }
 
 func (b *LocalBackend) checkSSHPrefsLocked(p *ipn.Prefs) error {
