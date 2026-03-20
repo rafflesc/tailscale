@@ -1349,7 +1349,7 @@ func TestLinkLocalAllow(t *testing.T) {
 	}
 }
 
-func TestConnectorLinkLocalAllow(t *testing.T) {
+func TestConnectorPacketFilterAllow(t *testing.T) {
 	knownTip := netip.MustParseAddr("100.64.0.41")
 	knownSrc := netip.MustParseAddr("100.64.0.1")
 	unknownTip := netip.MustParseAddr("100.64.0.42")
