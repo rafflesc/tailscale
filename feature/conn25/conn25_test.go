@@ -1336,13 +1336,13 @@ func TestLinkLocalAllow(t *testing.T) {
 		transit: knownTip,
 	})
 
-	if allow, _ := c.client.linkLocalAllow(&packet.Parsed{
+	if allow, _ := c.client.linkLocalAllow(packet.Parsed{
 		Dst: netip.AddrPortFrom(knownTip, 1234),
 	}); !allow {
 		t.Fatal("knownTip: should have been allowed")
 	}
 
-	if allow, _ := c.client.linkLocalAllow(&packet.Parsed{
+	if allow, _ := c.client.linkLocalAllow(packet.Parsed{
 		Dst: netip.AddrPort{},
 	}); allow {
 		t.Fatal("unknownTip: should not have been allowed")

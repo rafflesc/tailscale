@@ -510,7 +510,7 @@ func (c *client) ClientTransitIPForMagicIP(magicIP netip.Addr) (netip.Addr, erro
 // resources from local addresses, so it seems unlikely that using link-local addresses for transit
 // IPs will be a common use case. But it was the use case originally designed for and the first we
 // are targeting.
-func (c *client) linkLocalAllow(p *packet.Parsed) (bool, string) {
+func (c *client) linkLocalAllow(p packet.Parsed) (bool, string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	ok := c.isKnownTransitIP(p.Dst.Addr())
