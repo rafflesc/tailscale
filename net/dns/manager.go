@@ -47,9 +47,10 @@ var (
 const maxActiveQueries = 256
 
 // ResponseMapper is a function that accepts the bytes representing
-// a DNS response and returns bytes representing a DNS response.
+// a DNS response plus the IP and port of the resolver and returns
+// bytes representing a DNS response.
 // Used to observe and/or mutate DNS responses managed by this manager.
-type ResponseMapper func([]byte) []byte
+type ResponseMapper func([]byte, netip.AddrPort) []byte
 
 // We use file-ignore below instead of ignore because on some platforms,
 // the lint exception is necessary and on others it is not,
@@ -480,7 +481,7 @@ func (m *Manager) Query(ctx context.Context, bs []byte, family string, from neti
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.queryResponseMapper != nil {
-		outbs = m.queryResponseMapper(outbs)
+		outbs = m.queryResponseMapper(outbs, from)
 	}
 	return outbs, err
 }

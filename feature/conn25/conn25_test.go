@@ -8,11 +8,13 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"slices"
 	"testing"
 	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
+	"go4.org/mem"
 	"go4.org/netipx"
 	"golang.org/x/net/dns/dnsmessage"
 	"tailscale.com/ipn/ipnext"
@@ -20,6 +22,7 @@ import (
 	"tailscale.com/tailcfg"
 	"tailscale.com/tsd"
 	"tailscale.com/types/appctype"
+	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/opt"
 	"tailscale.com/util/dnsname"
@@ -391,7 +394,7 @@ func TestReserveIPs(t *testing.T) {
 	c.client.config.appNamesByDomain = mbd
 
 	dst := netip.MustParseAddr("0.0.0.1")
-	addrs, err := c.client.reserveAddresses("example.com.", dst)
+	addrs, err := c.client.reserveAddresses("example.com.", dst, key.NodePublic{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -670,6 +673,19 @@ func makeDNSResponseForSections(t *testing.T, questions []dnsmessage.Question, a
 }
 
 func TestMapDNSResponseAssignsAddrs(t *testing.T) {
+	connAddrPort := netip.MustParseAddrPort("100.100.100.1:53")
+	connNodeKey := key.NodePublicFromRaw32(mem.B([]byte{0: 0xff, 31: 0xfe}))
+	connectorPeer := (&tailcfg.Node{
+		ID:        tailcfg.NodeID(1),
+		Tags:      []string{"tag:woo"},
+		Hostinfo:  (&tailcfg.Hostinfo{AppConnector: opt.NewBool(true)}).View(),
+		Addresses: []netip.Prefix{netip.PrefixFrom(connAddrPort.Addr(), 32)},
+		Key:       connNodeKey,
+	}).View()
+	testNodeBackend := testNodeBackend{
+		peers: []tailcfg.NodeView{connectorPeer},
+	}
+
 	for _, tt := range []struct {
 		name          string
 		domain        string
@@ -688,6 +704,7 @@ func TestMapDNSResponseAssignsAddrs(t *testing.T) {
 					magic:   netip.MustParseAddr("100.64.0.0"),
 					transit: netip.MustParseAddr("100.64.0.40"),
 					app:     "app1",
+					connKey: connNodeKey,
 				},
 			},
 		},
@@ -705,6 +722,7 @@ func TestMapDNSResponseAssignsAddrs(t *testing.T) {
 					magic:   netip.MustParseAddr("100.64.0.0"),
 					transit: netip.MustParseAddr("100.64.0.40"),
 					app:     "app1",
+					connKey: connNodeKey,
 				},
 				netip.MustParseAddr("100.64.0.1"): {
 					domain:  "example.com.",
@@ -712,6 +730,7 @@ func TestMapDNSResponseAssignsAddrs(t *testing.T) {
 					magic:   netip.MustParseAddr("100.64.0.1"),
 					transit: netip.MustParseAddr("100.64.0.41"),
 					app:     "app1",
+					connKey: connNodeKey,
 				},
 			},
 		},
@@ -734,9 +753,10 @@ func TestMapDNSResponseAssignsAddrs(t *testing.T) {
 				TransitIPPool: []netipx.IPRange{rangeFrom("40", "50")},
 			}, []string{})
 			c := newConn25(logger.Discard)
+			c.client.setNodeBackend(&testNodeBackend)
 			c.reconfig(sn)
 
-			c.mapDNSResponse(dnsResp)
+			c.mapDNSResponse(dnsResp, connAddrPort)
 			if diff := cmp.Diff(tt.wantByMagicIP, c.client.assignments.byMagicIP, cmpopts.EquateComparable(addrs{}, netip.Addr{})); diff != "" {
 				t.Errorf("byMagicIP diff (-want, +got):\n%s", diff)
 			}
@@ -745,18 +765,20 @@ func TestMapDNSResponseAssignsAddrs(t *testing.T) {
 }
 
 func TestReserveAddressesDeduplicated(t *testing.T) {
+	connNodeKey := key.NodePublicFromRaw32(mem.B([]byte{0: 0xff, 1: 0xff, 30: 0xff, 31: 0xff}))
+
 	c := newConn25(logger.Discard)
 	c.client.magicIPPool = newIPPool(mustIPSetFromPrefix("100.64.0.0/24"))
 	c.client.transitIPPool = newIPPool(mustIPSetFromPrefix("169.254.0.0/24"))
 	c.client.config.appNamesByDomain = map[dnsname.FQDN][]string{"example.com.": {"a"}}
 
 	dst := netip.MustParseAddr("0.0.0.1")
-	first, err := c.client.reserveAddresses("example.com.", dst)
+	first, err := c.client.reserveAddresses("example.com.", dst, connNodeKey)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	second, err := c.client.reserveAddresses("example.com.", dst)
+	second, err := c.client.reserveAddresses("example.com.", dst, connNodeKey)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1004,6 +1026,18 @@ func TestMapDNSResponseRewritesResponses(t *testing.T) {
 		},
 	}, nil, nil)
 
+	connAddrPort := netip.MustParseAddrPort("100.100.100.1:53")
+	connectorPeer := (&tailcfg.Node{
+		ID:        tailcfg.NodeID(1),
+		Tags:      []string{"tag:woo"},
+		Hostinfo:  (&tailcfg.Hostinfo{AppConnector: opt.NewBool(true)}).View(),
+		Addresses: []netip.Prefix{netip.PrefixFrom(connAddrPort.Addr(), 32)},
+		Key:       key.NodePublicFromRaw32(mem.B([]byte{0: 0xff, 31: 0xfe})),
+	}).View()
+	testNodeBackend := testNodeBackend{
+		peers: []tailcfg.NodeView{connectorPeer},
+	}
+
 	for _, tt := range []struct {
 		name     string
 		toMap    []byte
@@ -1176,13 +1210,118 @@ func TestMapDNSResponseRewritesResponses(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			c := newConn25(logger.Discard)
+			c.client.setNodeBackend(&testNodeBackend)
 			if err := c.reconfig(sn); err != nil {
 				t.Fatal(err)
 			}
-			bs := c.mapDNSResponse(tt.toMap)
+			bs := c.mapDNSResponse(tt.toMap, connAddrPort)
 			tt.assertFx(t, bs)
 		})
 	}
+}
+
+func TestMapDNSResponseStoresTransitIPs(t *testing.T) {
+	configuredDomain := "example.com"
+	domainName := configuredDomain + "."
+	sn := makeSelfNode(t, appctype.Conn25Attr{
+		Name:          "app1",
+		Connectors:    []string{"tag:connector"},
+		Domains:       []string{configuredDomain},
+		MagicIPPool:   []netipx.IPRange{rangeFrom("0", "10")},
+		TransitIPPool: []netipx.IPRange{rangeFrom("40", "50")},
+	}, []string{})
+
+	connAddrPorts := []netip.AddrPort{
+		netip.MustParseAddrPort("100.100.100.1:53"),
+		netip.MustParseAddrPort("100.100.100.2:53"),
+	}
+	connectorPeers := []tailcfg.NodeView{
+		(&tailcfg.Node{
+			ID:        tailcfg.NodeID(1),
+			Tags:      []string{"tag:woo"},
+			Hostinfo:  (&tailcfg.Hostinfo{AppConnector: opt.NewBool(true)}).View(),
+			Addresses: []netip.Prefix{netip.PrefixFrom(connAddrPorts[0].Addr(), 32)},
+			Key:       key.NodePublicFromRaw32(mem.B([]byte{0: 0xff, 31: 0x01})),
+		}).View(),
+		(&tailcfg.Node{
+			ID:        tailcfg.NodeID(2),
+			Tags:      []string{"tag:woo"},
+			Hostinfo:  (&tailcfg.Hostinfo{AppConnector: opt.NewBool(true)}).View(),
+			Addresses: []netip.Prefix{netip.PrefixFrom(connAddrPorts[1].Addr(), 32)},
+			Key:       key.NodePublicFromRaw32(mem.B([]byte{0: 0xff, 31: 0x02})),
+		}).View(),
+	}
+	testNodeBackend := testNodeBackend{
+		peers: connectorPeers,
+	}
+
+	c := newConn25(logger.Discard)
+	c.client.setNodeBackend(&testNodeBackend)
+	if err := c.reconfig(sn); err != nil {
+		t.Fatal(err)
+	}
+
+	validateExpectedIPs := func(want, got []netip.Prefix) {
+		slices.SortFunc(got, func(a, b netip.Prefix) int { return a.Compare(b) })
+		if diff := cmp.Diff(want, got, cmpopts.EquateComparable(netip.Prefix{})); diff != "" {
+			t.Fatalf("transit IPs mismatch (-want +got):\n%s", diff)
+		}
+	}
+
+	var got []netip.Prefix
+	var ok bool
+
+	// We shouldn't have anything for the specified NodeKey yet
+	if _, ok = c.client.assignments.lookupTransitIPsByConnKey(connectorPeers[0].Key()); ok {
+		t.Fatal("unexpected ok result")
+	}
+
+	// First request from connector[0] should see
+	// a transit IP allocation for each A.
+	bs := c.mapDNSResponse(
+		makeDNSResponse(t, domainName, []*dnsmessage.AResource{
+			{A: netip.MustParseAddr("1.2.3.4").As4()},
+			{A: netip.MustParseAddr("5.6.7.8").As4()},
+		}), connAddrPorts[0])
+	parseResponse(t, bs)
+	want := []netip.Prefix{netip.MustParsePrefix("100.64.0.40/32"), netip.MustParsePrefix("100.64.0.41/32")}
+	if got, ok = c.client.assignments.lookupTransitIPsByConnKey(connectorPeers[0].Key()); !ok {
+		t.Fatal("expected ok after lookup")
+	}
+	validateExpectedIPs(want, got)
+
+	// Second request from connector[0] should see a transit IP allocation
+	// for each A appended to the existing list.
+	want = append(want, netip.MustParsePrefix("100.64.0.42/32"), netip.MustParsePrefix("100.64.0.43/32"))
+	bs = c.mapDNSResponse(
+		makeDNSResponse(t, domainName, []*dnsmessage.AResource{
+			{A: netip.MustParseAddr("1.2.3.5").As4()},
+			{A: netip.MustParseAddr("5.6.7.9").As4()},
+		}), connAddrPorts[0])
+	parseResponse(t, bs)
+	if got, ok = c.client.assignments.lookupTransitIPsByConnKey(connectorPeers[0].Key()); !ok {
+		t.Fatal("expected ok after lookup")
+	}
+	validateExpectedIPs(want, got)
+
+	// First request from connector[1] should see a transit IP allocation
+	// for each A added to connector[1]'s list, and connector[0]'s list
+	// should remain unchanged.
+	want2 := []netip.Prefix{netip.MustParsePrefix("100.64.0.44/32"), netip.MustParsePrefix("100.64.0.45/32")}
+	bs = c.mapDNSResponse(
+		makeDNSResponse(t, domainName, []*dnsmessage.AResource{
+			{A: netip.MustParseAddr("1.2.3.6").As4()},
+			{A: netip.MustParseAddr("5.6.7.10").As4()},
+		}), connAddrPorts[1])
+	parseResponse(t, bs)
+	if got, ok = c.client.assignments.lookupTransitIPsByConnKey(connectorPeers[0].Key()); !ok {
+		t.Fatal("expected ok after lookup")
+	}
+	validateExpectedIPs(want, got)
+	if got, ok = c.client.assignments.lookupTransitIPsByConnKey(connectorPeers[1].Key()); !ok {
+		t.Fatal("expected ok after lookup")
+	}
+	validateExpectedIPs(want2, got)
 }
 
 func TestClientTransitIPForMagicIP(t *testing.T) {

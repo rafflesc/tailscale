@@ -30,6 +30,7 @@ import (
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/appctype"
+	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
 	"tailscale.com/util/dnsname"
 	"tailscale.com/util/mak"
@@ -109,6 +110,8 @@ func (e *extension) Init(host ipnext.Host) error {
 		return nil
 	}
 	e.host = host
+	e.conn25.client.setNodeBackend(host.NodeBackend())
+
 	host.Hooks().OnSelfChange.Add(e.onSelfChange)
 	ctx, cancel := context.WithCancelCause(context.Background())
 	e.ctxCancel = cancel
@@ -249,10 +252,12 @@ func (c *Conn25) reconfig(selfNode tailcfg.NodeView) error {
 }
 
 // mapDNSResponse parses and inspects the DNS response, and uses the
-// contents to assign addresses for connecting. It does not yet modify
-// the response.
-func (c *Conn25) mapDNSResponse(buf []byte) []byte {
-	return c.client.mapDNSResponse(buf)
+// contents to assign addresses for connecting. The from parameter
+// is the IP address of the resolver that provided this response,
+// which is used to determine which connector, if any, any mapped
+// transit IPs should be associated with.
+func (c *Conn25) mapDNSResponse(buf []byte, from netip.AddrPort) []byte {
+	return c.client.mapDNSResponse(buf, from)
 }
 
 const dupeTransitIPMessage = "Duplicate transit address in ConnectorTransitIPRequest"
@@ -483,6 +488,7 @@ type client struct {
 	transitIPPool *ippool
 	assignments   addrAssignments
 	config        config
+	nodeBackend   ipnext.NodeBackend
 }
 
 // ClientTransitIPForMagicIP is part of the implementation of the IPMapper interface for dataflows lookups.
@@ -503,6 +509,12 @@ func (c *client) isConfigured() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.config.isConfigured
+}
+
+func (c *client) setNodeBackend(nb ipnext.NodeBackend) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.nodeBackend = nb
 }
 
 func (c *client) reconfig(newCfg config) error {
@@ -527,7 +539,9 @@ func (c *client) isConnectorDomain(domain dnsname.FQDN) bool {
 // for this domain+dst address, so that this client can use conn25 connectors.
 // It checks that this domain should be routed and that this client is not itself a connector for the domain
 // and generally if it is valid to make the assignment.
-func (c *client) reserveAddresses(domain dnsname.FQDN, dst netip.Addr) (addrs, error) {
+// The connKey parameter should be the public key for the connector that will receive these transit IPs.
+// A zero connKey is allowed for testing purposes.
+func (c *client) reserveAddresses(domain dnsname.FQDN, dst netip.Addr, connKey key.NodePublic) (addrs, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if existing, ok := c.assignments.lookupByDomainDst(domain, dst); ok {
@@ -553,6 +567,7 @@ func (c *client) reserveAddresses(domain dnsname.FQDN, dst netip.Addr) (addrs, e
 		transit: tip,
 		app:     app,
 		domain:  domain,
+		connKey: connKey,
 	}
 	if err := c.assignments.insert(as); err != nil {
 		return addrs{}, err
@@ -683,7 +698,7 @@ func makeServFail(logf logger.Logf, h dnsmessage.Header, q dnsmessage.Question) 
 	return bs
 }
 
-func (c *client) mapDNSResponse(buf []byte) []byte {
+func (c *client) mapDNSResponse(buf []byte, from netip.AddrPort) []byte {
 	var p dnsmessage.Parser
 	hdr, err := p.Start(buf)
 	if err != nil {
@@ -721,7 +736,7 @@ func (c *client) mapDNSResponse(buf []byte) []byte {
 	if question.Type != dnsmessage.TypeA {
 		// we plan to support TypeAAAA soon (2026-03-11)
 		c.logf("mapping dns response for connector domain, unsupported type: %v", question.Type)
-		newBuf, err := c.rewriteDNSResponse(hdr, questions, answers)
+		newBuf, err := c.rewriteDNSResponse(hdr, questions, answers, from)
 		if err != nil {
 			c.logf("error writing empty response for unsupported type: %v", err)
 			return makeServFail(c.logf, hdr, question)
@@ -787,7 +802,7 @@ func (c *client) mapDNSResponse(buf []byte) []byte {
 			}
 		}
 	}
-	newBuf, err := c.rewriteDNSResponse(hdr, questions, answers)
+	newBuf, err := c.rewriteDNSResponse(hdr, questions, answers, from)
 	if err != nil {
 		c.logf("error rewriting dns response: %v", err)
 		return makeServFail(c.logf, hdr, question)
@@ -795,7 +810,7 @@ func (c *client) mapDNSResponse(buf []byte) []byte {
 	return newBuf
 }
 
-func (c *client) rewriteDNSResponse(hdr dnsmessage.Header, questions []dnsmessage.Question, answers []dnsResponseRewrite) ([]byte, error) {
+func (c *client) rewriteDNSResponse(hdr dnsmessage.Header, questions []dnsmessage.Question, answers []dnsResponseRewrite, from netip.AddrPort) ([]byte, error) {
 	// We are currently (2026-03-10) only doing this for AResource records, we know that if we are here
 	// with non-empty answers, the type was AResource.
 	b := dnsmessage.NewBuilder(nil, hdr)
@@ -811,9 +826,38 @@ func (c *client) rewriteDNSResponse(hdr dnsmessage.Header, questions []dnsmessag
 	if err := b.StartAnswers(); err != nil {
 		return nil, err
 	}
+
+	var connKey key.NodePublic
+	if len(answers) > 0 {
+		if c.nodeBackend == nil {
+			return nil, errors.New("missing nodebackend")
+		}
+		// We really just want to do a lookup of the IP, get a NodeView, and then
+		// extract the Node's public key. So pull out the key from the first matching
+		// node, and then skip the rest of the checking, and never tell AppendMatchingPeers
+		// that we've matched. We're also assuming that the resolver IP that is passed in
+		// corresponds to a connector.
+		// TODO (george) 2026-03-20 we should add NodeByAddr and NodeByID to the ipnext.NodeBackend
+		// avoid iterating over the entire tailnet.
+		c.nodeBackend.AppendMatchingPeers(nil, func(nv tailcfg.NodeView) bool {
+			if connKey.IsZero() {
+				for _, ip := range nv.Addresses().All() {
+					if ip.IsSingleIP() && ip.Addr() == from.Addr() {
+						connKey = nv.Key()
+					}
+				}
+			}
+			return false
+		})
+
+		if connKey.IsZero() {
+			return nil, errors.New("could not find node key for connector")
+		}
+	}
+
 	// make an answer for each rewrite
 	for _, rw := range answers {
-		as, err := c.reserveAddresses(rw.domain, rw.dst)
+		as, err := c.reserveAddresses(rw.domain, rw.dst, connKey)
 		if err != nil {
 			return nil, err
 		}
@@ -885,6 +929,7 @@ type addrs struct {
 	transit netip.Addr
 	domain  dnsname.FQDN
 	app     string
+	connKey key.NodePublic
 }
 
 func (c addrs) isValid() bool {
@@ -899,10 +944,12 @@ type domainDst struct {
 }
 
 // addrAssignments is the collection of addrs assigned by this client
-// supporting lookup by magicip or domain+dst
+// supporting lookup by magicip or domain+dst, or to lookup all
+// transit IPs associated with a given connector (identified by its node key).
 type addrAssignments struct {
 	byMagicIP   map[netip.Addr]addrs
 	byDomainDst map[domainDst]addrs
+	byConnKey   map[key.NodePublic]set.Set[netip.Prefix]
 }
 
 func (a *addrAssignments) insert(as addrs) error {
@@ -915,6 +962,19 @@ func (a *addrAssignments) insert(as addrs) error {
 	if _, ok := a.byDomainDst[ddst]; ok {
 		return errors.New("byDomainDst key exists")
 	}
+
+	ctips, ok := a.byConnKey[as.connKey]
+	tipp := netip.PrefixFrom(as.transit, as.transit.BitLen())
+	if ok {
+		if ctips.Contains(tipp) {
+			return errors.New("byConnKey contains transit")
+		}
+	} else {
+		ctips.Make()
+		mak.Set(&a.byConnKey, as.connKey, ctips)
+	}
+	ctips.Add(tipp)
+
 	mak.Set(&a.byMagicIP, as.magic, as)
 	mak.Set(&a.byDomainDst, ddst, as)
 	return nil
@@ -928,4 +988,15 @@ func (a *addrAssignments) lookupByDomainDst(domain dnsname.FQDN, dst netip.Addr)
 func (a *addrAssignments) lookupByMagicIP(mip netip.Addr) (addrs, bool) {
 	v, ok := a.byMagicIP[mip]
 	return v, ok
+}
+
+// lookupTransitIPsByConnKey returns a slice containing the transit IPs associated with
+// the given connector (identified by node key), or (nil, false) if there is no entry
+// for the given key.
+func (a *addrAssignments) lookupTransitIPsByConnKey(k key.NodePublic) ([]netip.Prefix, bool) {
+	s, ok := a.byConnKey[k]
+	if !ok {
+		return nil, false
+	}
+	return s.Slice(), true
 }
