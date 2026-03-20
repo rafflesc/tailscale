@@ -501,7 +501,7 @@ func (c *client) ClientTransitIPForMagicIP(magicIP netip.Addr) (netip.Addr, erro
 }
 
 // linkLocalAllow returns true if the provided packet with a link-local Dst address has a
-// Dst that is one of our  transit IPs, and false otherwise.
+// Dst that is one of our transit IPs, and false otherwise.
 // Tailscale's wireguard filters drop link-local unicast packets (see [wgengine/filter/filter.go])
 // but in some modes of operation conn25 uses link-local addresses for transit IPs.
 // Let the filter know if this is one of our addresses and should be allowed.
