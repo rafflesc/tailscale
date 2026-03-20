@@ -242,27 +242,19 @@ func (k NodePublic) AppendTo(buf []byte) []byte {
 }
 
 // ReadRawWithoutAllocating initializes k with bytes read from br.
-// The reading is done ~4x slower than io.ReadFull, but in exchange is
-// allocation-free.
+// It uses Peek+Discard to read the key as a zero-copy slice
+// directly from bufio's internal buffer, then copies it into k.
 func (k *NodePublic) ReadRawWithoutAllocating(br *bufio.Reader) error {
 	var z NodePublic
 	if *k != z {
 		return errors.New("refusing to read into non-zero NodePublic")
 	}
-	// This is ~4x slower than io.ReadFull, but using io.ReadFull
-	// causes one extra alloc, which is significant for the DERP
-	// server that consumes this method. So, process stuff slower but
-	// without allocation.
-	//
-	// Dear future: if io.ReadFull stops causing stuff to escape, you
-	// should switch back to that.
-	for i := range k.k {
-		b, err := br.ReadByte()
-		if err != nil {
-			return err
-		}
-		k.k[i] = b
+	buf, err := br.Peek(len(k.k))
+	if err != nil {
+		return err
 	}
+	defer br.Discard(len(k.k))
+	copy(k.k[:], buf)
 	return nil
 }
 

@@ -183,21 +183,6 @@ func writeUint32(bw *bufio.Writer, v uint32) error {
 	return nil
 }
 
-func readUint32(br *bufio.Reader) (uint32, error) {
-	var b [4]byte
-	// Reading a byte at a time is a bit silly,
-	// but it causes b not to escape,
-	// which more than pays for the silliness.
-	for i := range &b {
-		c, err := br.ReadByte()
-		if err != nil {
-			return 0, err
-		}
-		b[i] = c
-	}
-	return bin.Uint32(b[:]), nil
-}
-
 // ReadFrameTypeHeader reads a frame header from br and
 // verifies that the frame type matches wantType.
 //
@@ -215,16 +200,17 @@ func ReadFrameTypeHeader(br *bufio.Reader, wantType FrameType) (frameLen uint32,
 
 // ReadFrameHeader reads the header of a DERP frame,
 // reading 5 bytes from br.
+//
+// It uses Peek+Discard to read the header as a zero-copy
+// slice directly from bufio's internal buffer, avoiding
+// per-byte function call overhead.
 func ReadFrameHeader(br *bufio.Reader) (t FrameType, frameLen uint32, err error) {
-	tb, err := br.ReadByte()
+	hdr, err := br.Peek(5)
 	if err != nil {
 		return 0, 0, err
 	}
-	frameLen, err = readUint32(br)
-	if err != nil {
-		return 0, 0, err
-	}
-	return FrameType(tb), frameLen, nil
+	defer br.Discard(5)
+	return FrameType(hdr[0]), bin.Uint32(hdr[1:5]), nil
 }
 
 // readFrame reads a frame header and then reads its payload into

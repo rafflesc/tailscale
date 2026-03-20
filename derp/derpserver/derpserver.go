@@ -1088,10 +1088,12 @@ func (c *sclient) handleFramePing(ft derp.FrameType, fl uint32) error {
 		// space for future extensibility, but not too much.
 		return fmt.Errorf("ping body too large: %v", fl)
 	}
-	_, err := io.ReadFull(c.br, m[:])
+	buf, err := c.br.Peek(len(m))
 	if err != nil {
 		return err
 	}
+	copy(m[:], buf)
+	c.br.Discard(len(m))
 	if extra := int64(fl) - int64(len(m)); extra > 0 {
 		_, err = io.CopyN(io.Discard, c.br, extra)
 	}
